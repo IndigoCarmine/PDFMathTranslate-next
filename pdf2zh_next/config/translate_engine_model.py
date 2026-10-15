@@ -1,3 +1,4 @@
+import ipaddress
 import logging
 import re
 import typing
@@ -6,6 +7,7 @@ from inspect import getdoc
 from types import NoneType
 from typing import Literal
 from typing import TypeAlias
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel
 from pydantic import Field
@@ -34,10 +36,10 @@ class TranslateEngineSettingError(Exception):
 
 ## Translator configuration classes.
 #
-# Document content may only leave this machine through the Claude Code CLI.
-# Translators that send text to any other service (HTTP APIs, local LLM servers,
-# arbitrary external commands) have been removed on purpose; do not add them
-# back.
+# Document content may only leave this machine through the Claude Code CLI, or,
+# for term extraction only, go to an Ollama server on the local network.
+# Translators that send text to any other service (HTTP APIs, arbitrary
+# external commands) have been removed on purpose; do not add them back.
 #
 # Please note that all translator configurations must be of string type,
 # otherwise the GUI will not function properly!
@@ -46,10 +48,34 @@ class TranslateEngineSettingError(Exception):
 # And complete type conversion (if any) in the corresponding implementation of the translator.
 
 
+def _check_local_network_url(url: str, field: str) -> None:
+    """Reject URLs that are not http(s) or name a public IP address.
+
+    Host names are resolved and checked again on every connection by the
+    translator (see pdf2zh_next.net_guard), so this only catches obvious
+    mistakes early.
+    """
+    from pdf2zh_next.net_guard import is_local_network_ip
+
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError(f"{field} must be an http(s) URL: {url}")
+    try:
+        is_ip = bool(ipaddress.ip_address(parts.hostname))
+    except ValueError:
+        is_ip = False
+    if is_ip and not is_local_network_ip(parts.hostname):
+        raise ValueError(f"{field} must be on the local network: {url}")
+
+
 class ClaudeCodeSettings(BaseModel):
     """Claude Code settings"""
 
     translate_engine_type: Literal["ClaudeCode"] = Field(default="ClaudeCode")
+    # Lets BabelDOC send its own prompts (with glossary terms) through Claude.
+    support_llm: Literal["yes", "no"] = Field(
+        default="yes", description="Whether the translator supports LLM"
+    )
     claude_code_path: str = Field(
         default="claude", description="Path to Claude Code CLI"
     )
@@ -69,11 +95,45 @@ class ClaudeCodeSettings(BaseModel):
 GUI_LOCAL_ONLY_FIELDS.append("claude_code_path")
 
 
+class OllamaSettings(BaseModel):
+    """Ollama settings (term extraction only, local network only)"""
+
+    translate_engine_type: Literal["Ollama"] = Field(default="Ollama")
+    support_llm: Literal["yes", "no"] = Field(
+        default="yes", description="Whether the translator supports LLM"
+    )
+    ollama_host: str | None = Field(
+        default=None,
+        description="Ollama server URL on the local network, e.g. http://192.168.1.10:11434",
+    )
+    ollama_model: str = Field(default="gemma2", description="Ollama model to use")
+    num_predict: int | None = Field(
+        default=2000, description="The max number of token to predict."
+    )
+
+    def validate_settings(self) -> None:
+        if not self.ollama_host:
+            raise ValueError("Ollama host is required")
+        self.ollama_host = self.ollama_host.strip().rstrip("/")
+        _check_local_network_url(self.ollama_host, "Ollama host")
+        self.ollama_model = self.ollama_model.strip()
+        if not self.ollama_model:
+            raise ValueError("Ollama model is required")
+
+
+# Set via CLI / config file only: from the WebUI it would let anyone pick which
+# local host receives the document text.
+GUI_LOCAL_ONLY_FIELDS.append("ollama_host")
+
+
 ## Please add the translator configuration class above this location.
 
 # 所有翻译引擎
 _TRANSLATION_ENGINE_SETTING_TYPES: tuple[type[BaseModel], ...] = (ClaudeCodeSettings,)
 TRANSLATION_ENGINE_SETTING_TYPE: TypeAlias = ClaudeCodeSettings
+
+# Engines that may only be used for term extraction, never for translation.
+_TERM_EXTRACTION_ENGINE_SETTING_TYPES: tuple[type[BaseModel], ...] = (OllamaSettings,)
 
 # 不支持的翻译引擎
 NOT_SUPPORTED_TRANSLATION_ENGINE_SETTING_TYPE: TypeAlias = NoneType
@@ -145,22 +205,28 @@ for metadata in TRANSLATION_ENGINE_METADATA:
 del dedup_set
 
 
-# Term extraction can only use LLM-capable translation engines. Claude Code is
-# not one, so there are currently no separate term extraction engines and term
-# extraction never sends text anywhere on its own.
-_TERM_EXTRACTION_ENGINE_SETTING_TYPE: typing.Any = NoneType
-for metadata in TRANSLATION_ENGINE_METADATA:
-    if not metadata.support_llm:
-        continue
-    if _TERM_EXTRACTION_ENGINE_SETTING_TYPE is NoneType:
-        _TERM_EXTRACTION_ENGINE_SETTING_TYPE = metadata.setting_model_type
-    else:
-        _TERM_EXTRACTION_ENGINE_SETTING_TYPE = (
-            _TERM_EXTRACTION_ENGINE_SETTING_TYPE | metadata.setting_model_type
-        )
+# Term extraction only runs with a dedicated term extraction engine (a local
+# network Ollama server); it never falls back to the translation engine.
+_TERM_ONLY_ENGINE_METADATA = [
+    TranslationEngineMetadata(setting_model_type=arg)
+    for arg in _TERM_EXTRACTION_ENGINE_SETTING_TYPES
+]
+assert all(m.support_llm for m in _TERM_ONLY_ENGINE_METADATA), (
+    "Term extraction engines must support LLM"
+)
+assert not (
+    {m.cli_flag_name for m in _TERM_ONLY_ENGINE_METADATA}
+    & {m.cli_flag_name for m in TRANSLATION_ENGINE_METADATA}
+), "An engine cannot be both a translation and a term-only engine"
 
-# 术语提取引擎：仅包含 support_llm == \"yes\" 的翻译引擎设置类型
-TERM_EXTRACTION_ENGINE_SETTING_TYPE: TypeAlias = _TERM_EXTRACTION_ENGINE_SETTING_TYPE
+# Every engine a translator instance can be created for.
+ENGINE_METADATA_MAP = {
+    metadata.translate_engine_type: metadata
+    for metadata in TRANSLATION_ENGINE_METADATA + _TERM_ONLY_ENGINE_METADATA
+}
+
+# 术语提取引擎
+TERM_EXTRACTION_ENGINE_SETTING_TYPE: TypeAlias = OllamaSettings
 
 
 def _build_term_setting_model(
@@ -224,9 +290,7 @@ class TermTranslationEngineMetadata:
 
 TERM_EXTRACTION_ENGINE_METADATA: list[TermTranslationEngineMetadata] = []
 
-for metadata in TRANSLATION_ENGINE_METADATA:
-    if not metadata.support_llm:
-        continue
+for metadata in _TERM_ONLY_ENGINE_METADATA:
     term_setting_model_type = _build_term_setting_model(metadata.setting_model_type)
     TERM_EXTRACTION_ENGINE_METADATA.append(
         TermTranslationEngineMetadata(

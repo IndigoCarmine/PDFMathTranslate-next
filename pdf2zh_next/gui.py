@@ -2,13 +2,11 @@ import asyncio
 import cgi
 import csv
 import io
-import ipaddress
 import json
 import logging
 import mimetypes
 import re
 import shutil
-import socket
 import tempfile
 import typing
 import urllib.parse
@@ -21,7 +19,6 @@ from string import Template
 import chardet
 import gradio as gr
 import requests
-import urllib3
 import yaml
 from babeldoc import __version__ as babeldoc_version
 from gradio_i18n import Translate
@@ -50,6 +47,8 @@ from pdf2zh_next.high_level import do_translate_async_stream
 from pdf2zh_next.i18n import LANGUAGES
 from pdf2zh_next.i18n import gettext as _
 from pdf2zh_next.i18n import update_current_languages
+from pdf2zh_next.net_guard import guarded_session
+from pdf2zh_next.net_guard import is_public_ip
 
 logger = logging.getLogger(__name__)
 
@@ -289,7 +288,8 @@ if settings.gui_settings.enabled_services:
 available_term_services = [
     x.translate_engine_type
     for x in TERM_EXTRACTION_ENGINE_METADATA
-    if x.translate_engine_type in available_services
+    if not settings.gui_settings.enabled_services
+    or x.translate_engine_type.lower() in enabled_services
 ]
 
 assert available_services, "No translation service is enabled"
@@ -332,98 +332,15 @@ _WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {
 }
 
 
-def _is_public_ip(ip_str: str) -> bool:
-    ip = ipaddress.ip_address(ip_str.split("%", 1)[0])
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-        ip = ip.ipv4_mapped
-    return ip.is_global and not ip.is_multicast
-
-
-class _PublicOnlyConnectionMixin:
-    """Only lets urllib3 connect to public internet addresses.
-
-    The host urllib3 itself will connect to is resolved and checked before
-    connecting (so non-public hosts are never contacted, and closed/open ports
-    cannot be told apart), and the connected socket is checked again before
-    any request bytes are sent (so DNS rebinding cannot slip through either).
-    Redirects open new connections and go through the same checks.
-    """
-
-    def _new_conn(self):
-        try:
-            infos = socket.getaddrinfo(
-                self._dns_host, self.port, proto=socket.IPPROTO_TCP
-            )
-        except OSError as e:
-            raise gr.Error(_DOWNLOAD_FAILED) from e
-        addresses = [info[4][0] for info in infos]
-        if not addresses or not all(_is_public_ip(a) for a in addresses):
-            raise gr.Error(_DOWNLOAD_FAILED)
-        # Connect to the address checked above instead of resolving the name
-        # again, so DNS rebinding cannot change the target. TLS SNI and
-        # certificate checks still use the original host name.
-        try:
-            sock = urllib3.util.connection.create_connection(
-                (addresses[0], self.port),
-                self.timeout,
-                source_address=self.source_address,
-                socket_options=self.socket_options,
-            )
-        except OSError as e:
-            raise gr.Error(_DOWNLOAD_FAILED) from e
-        peer, local = sock.getpeername()[0], sock.getsockname()[0]
-        # Also refuse the host itself on one of its own public addresses
-        # (e.g. a global IPv6 address): then both ends share the address.
-        if not _is_public_ip(peer) or peer == local:
-            sock.close()
-            raise gr.Error(_DOWNLOAD_FAILED)
-        return sock
-
-
-class _PublicOnlyHTTPConnection(
-    _PublicOnlyConnectionMixin, urllib3.connection.HTTPConnection
-):
-    pass
-
-
-class _PublicOnlyHTTPSConnection(
-    _PublicOnlyConnectionMixin, urllib3.connection.HTTPSConnection
-):
-    pass
-
-
-class _PublicOnlyHTTPConnectionPool(urllib3.HTTPConnectionPool):
-    ConnectionCls = _PublicOnlyHTTPConnection
-
-
-class _PublicOnlyHTTPSConnectionPool(urllib3.HTTPSConnectionPool):
-    ConnectionCls = _PublicOnlyHTTPSConnection
-
-
-class _PublicOnlyAdapter(requests.adapters.HTTPAdapter):
-    def init_poolmanager(self, *args, **kwargs):
-        super().init_poolmanager(*args, **kwargs)
-        self.poolmanager.pool_classes_by_scheme = {
-            "http": _PublicOnlyHTTPConnectionPool,
-            "https": _PublicOnlyHTTPSConnectionPool,
-        }
-
-
 def _open_download(url: str) -> requests.Response:
     """GET a user-supplied URL; only public internet hosts can be reached."""
     if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
         raise gr.Error("Only http(s) URLs are supported")
-    session = requests.Session()
-    # No proxies: through a proxy the connected peer would be the proxy, and
-    # the target address could not be checked.
-    session.trust_env = False
+    session = guarded_session(is_public_ip, reject_own_address=True)
     session.max_redirects = _MAX_DOWNLOAD_REDIRECTS
-    adapter = _PublicOnlyAdapter()
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
     try:
         return session.get(url, stream=True, timeout=10)
-    except (gr.Error, requests.exceptions.ConnectionError) as e:
+    except requests.exceptions.ConnectionError as e:
         raise gr.Error(_DOWNLOAD_FAILED) from e
 
 
@@ -831,6 +748,8 @@ def _build_translate_settings(
 
             for field_name, field in term_model_type.model_fields.items():
                 if field_name in ("translate_engine_type", "support_llm"):
+                    continue
+                if field_name.removeprefix("term_") in GUI_LOCAL_ONLY_FIELDS:
                     continue
 
                 value = ui_inputs.get(field_name)
@@ -2960,8 +2879,11 @@ with gr.Blocks(
                             term_service = gr.Dropdown(
                                 label=_("Term extraction engine"),
                                 choices=[
+                                    # The main engine (Claude Code) is never used
+                                    # for term extraction, so this choice turns
+                                    # term extraction off.
                                     (
-                                        _("Follow main translation engine"),
+                                        _("None (no term extraction)"),
                                         "Follow main translation engine",
                                     )
                                 ]

@@ -560,10 +560,15 @@ class TestConfigManager:
         from pdf2zh_next.config.main import _translation_engine_flag_names
 
         assert _translation_engine_flag_names == ["claudecode"]
-        assert _term_translation_engine_flag_names == []
+        assert _term_translation_engine_flag_names == ["term_ollama"]
 
         cm = ConfigManager()
         result = cm.merge_settings(
-            [{"google": True}, {"term_openai": True}, {"claudecode": True}]
+            [
+                {"google": True},
+                {"term_openai": True},
+                {"claudecode": True, "term_ollama": True},
+            ]
         )
         assert result.get("claudecode") is True
+        assert result.get("term_ollama") is True

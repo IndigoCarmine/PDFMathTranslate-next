@@ -53,6 +53,16 @@ class ClaudeCodeTranslator(BaseTranslator):
                 f"Claude Code CLI not found at '{self.claude_code_path}'"
             ) from e
 
+    def do_translate(self, text, rate_limit_params: dict = None) -> str:
+        return self._run_claude(self.prompt(text)[0])
+
+    def do_llm_translate(self, text, rate_limit_params: dict = None):
+        # BabelDOC calls this with None to check for LLM support.
+        if text is None:
+            return None
+        # BabelDOC's own prompt, e.g. with glossary terms for consistency
+        return self._run_claude({"role": "user", "content": text})
+
     @retry(
         retry=retry_if_exception_type(
             (subprocess.CalledProcessError, subprocess.TimeoutExpired)
@@ -61,9 +71,8 @@ class ClaudeCodeTranslator(BaseTranslator):
         wait=wait_exponential(multiplier=2, min=2, max=15),
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
-    def do_translate(self, text, rate_limit_params: dict = None) -> str:
-        messages = self.prompt(text)
-        input_data = json.dumps({"type": "user", "message": messages[0]})
+    def _run_claude(self, message: dict) -> str:
+        input_data = json.dumps({"type": "user", "message": message})
 
         # The text comes from the PDF and may contain prompt injection, so run
         # without any tools: no built-in tools (--tools "") and none of the

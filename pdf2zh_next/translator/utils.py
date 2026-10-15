@@ -2,10 +2,10 @@ import importlib
 import logging
 
 from pdf2zh_next.config.model import SettingsModel
+from pdf2zh_next.config.translate_engine_model import ENGINE_METADATA_MAP
 from pdf2zh_next.config.translate_engine_model import (
     NOT_SUPPORTED_TRANSLATION_ENGINE_SETTING_TYPE,
 )
-from pdf2zh_next.config.translate_engine_model import TRANSLATION_ENGINE_METADATA
 from pdf2zh_next.config.translate_engine_model import TranslateEngineSettingError
 from pdf2zh_next.translator.base_rate_limiter import BaseRateLimiter
 from pdf2zh_next.translator.base_translator import BaseTranslator
@@ -40,7 +40,7 @@ def _create_translator_instance(
             f"{translator_config.translate_engine_type} is not supported, Please use other translator!"
         )
 
-    for metadata in TRANSLATION_ENGINE_METADATA:
+    for metadata in ENGINE_METADATA_MAP.values():
         if isinstance(translator_config, metadata.setting_model_type):
             translate_engine_type = metadata.translate_engine_type
             logger.info(f"Using {translate_engine_type} translator")

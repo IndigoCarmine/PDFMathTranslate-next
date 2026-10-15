@@ -20,6 +20,7 @@ from pydantic import BaseModel
 
 from pdf2zh_next.config.cli_env_model import CLIEnvSettingsModel
 from pdf2zh_next.config.model import SettingsModel
+from pdf2zh_next.config.translate_engine_model import TERM_EXTRACTION_ENGINE_METADATA
 from pdf2zh_next.config.translate_engine_model import TRANSLATION_ENGINE_METADATA
 from pdf2zh_next.const import DEFAULT_CONFIG_DIR
 from pdf2zh_next.const import DEFAULT_CONFIG_FILE
@@ -32,7 +33,7 @@ from pdf2zh_next.const import WRITE_TEMP_CONFIG_FILE
 
 _translation_engine_flag_names = [x.cli_flag_name for x in TRANSLATION_ENGINE_METADATA]
 _term_translation_engine_flag_names = [
-    f"term_{x.cli_flag_name}" for x in TRANSLATION_ENGINE_METADATA if x.support_llm
+    f"term_{x.cli_flag_name}" for x in TERM_EXTRACTION_ENGINE_METADATA
 ]
 
 log = logging.getLogger(__name__)

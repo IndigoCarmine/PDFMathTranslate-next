@@ -9,9 +9,11 @@ from pydantic import BaseModel
 from pydantic import Field
 
 from pdf2zh_next.config.translate_engine_model import (
+    TERM_EXTRACTION_ENGINE_METADATA_MAP,
+)
+from pdf2zh_next.config.translate_engine_model import (
     TERM_EXTRACTION_ENGINE_SETTING_TYPE,
 )
-from pdf2zh_next.config.translate_engine_model import TRANSLATION_ENGINE_METADATA_MAP
 from pdf2zh_next.config.translate_engine_model import TRANSLATION_ENGINE_SETTING_TYPE
 
 log = logging.getLogger(__name__)
@@ -277,45 +279,32 @@ class SettingsModel(BaseModel):
             log.info(f"Transformed translate_engine_settings: {from_type} -> {to_type}")
             self.translate_engine_settings.validate_settings()
 
-        # Validate and normalize term extraction engine settings
-        main_engine_type = self.translate_engine_settings.translate_engine_type
-        main_metadata = TRANSLATION_ENGINE_METADATA_MAP.get(main_engine_type)
-
+        # Validate term extraction engine settings. Term extraction only runs
+        # with a dedicated term extraction engine (a local network Ollama
+        # server); it never falls back to the translation engine.
         if self.term_extraction_engine_settings is not None:
             term_engine_type = (
                 self.term_extraction_engine_settings.translate_engine_type
             )
-            term_metadata = TRANSLATION_ENGINE_METADATA_MAP.get(term_engine_type)
-            if not term_metadata or not term_metadata.support_llm:
+            if term_engine_type not in TERM_EXTRACTION_ENGINE_METADATA_MAP:
                 raise ValueError(
-                    f"Term extraction engine {term_engine_type} must support LLM"
+                    f"{term_engine_type} cannot be used for term extraction"
                 )
-            # Validate and transform term extraction engine if necessary
-            if hasattr(self.term_extraction_engine_settings, "validate_settings"):
+            try:
                 self.term_extraction_engine_settings.validate_settings()
-            if hasattr(self.term_extraction_engine_settings, "transform"):
-                from_type = self.term_extraction_engine_settings.translate_engine_type
-                self.term_extraction_engine_settings = (
-                    self.term_extraction_engine_settings.transform()
-                )
-                to_type = self.term_extraction_engine_settings.translate_engine_type
-                log.info(
-                    f"Transformed term_extraction_engine_settings: {from_type} -> {to_type}"
-                )
-                if hasattr(self.term_extraction_engine_settings, "validate_settings"):
-                    self.term_extraction_engine_settings.validate_settings()
-        else:
-            # Default behavior: follow main engine if it supports LLM, otherwise disable auto term extraction
-            if main_metadata and main_metadata.support_llm:
-                self.term_extraction_engine_settings = self.translate_engine_settings
-            else:
+            except ValueError as e:
+                log.warning(f"Term extraction engine {term_engine_type}: {e}")
                 self.term_extraction_engine_settings = None
-                if not self.translation.no_auto_extract_glossary:
-                    self.translation.no_auto_extract_glossary = True
-                    log.warning(
-                        "Current translation engine does not support LLM, "
-                        "automatic term extraction will be disabled."
-                    )
+
+        if (
+            self.term_extraction_engine_settings is None
+            and not self.translation.no_auto_extract_glossary
+        ):
+            self.translation.no_auto_extract_glossary = True
+            log.warning(
+                "No term extraction engine (Ollama on the local network) is "
+                "configured, automatic term extraction will be disabled."
+            )
 
         # Validate files
         for file in self.basic.input_files:

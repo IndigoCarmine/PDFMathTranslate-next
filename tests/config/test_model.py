@@ -5,9 +5,11 @@ from pdf2zh_next.config.cli_env_model import CLIEnvSettingsModel
 from pdf2zh_next.config.model import BasicSettings
 from pdf2zh_next.config.model import PDFSettings
 from pdf2zh_next.config.model import TranslationSettings
+from pdf2zh_next.config.translate_engine_model import GUI_LOCAL_ONLY_FIELDS
 from pdf2zh_next.config.translate_engine_model import TERM_EXTRACTION_ENGINE_METADATA
 from pdf2zh_next.config.translate_engine_model import TRANSLATION_ENGINE_METADATA
 from pdf2zh_next.config.translate_engine_model import ClaudeCodeSettings
+from pdf2zh_next.config.translate_engine_model import OllamaSettings
 
 
 class TestBasicSettings:
@@ -189,15 +191,60 @@ class TestPDFSettings:
 
 
 class TestClaudeCodeOnly:
-    """Document content may only leave the machine through the Claude Code CLI."""
+    """Document content may only leave the machine through the Claude Code CLI
+    (or, for term extraction only, go to an Ollama server on the local network)."""
 
     def test_claude_code_is_the_only_engine(self):
         assert [m.translate_engine_type for m in TRANSLATION_ENGINE_METADATA] == [
             "ClaudeCode"
         ]
-        # No separate term extraction engines, so term extraction never sends
-        # text anywhere on its own.
-        assert TERM_EXTRACTION_ENGINE_METADATA == []
+        assert [m.translate_engine_type for m in TERM_EXTRACTION_ENGINE_METADATA] == [
+            "Ollama"
+        ]
+
+    def test_ollama_cannot_be_the_translation_engine(self):
+        settings = CLIEnvSettingsModel(
+            ollama=True, ollama_detail={"ollama_host": "http://192.168.1.10:11434"}
+        ).to_settings_model()
+        assert isinstance(settings.translate_engine_settings, ClaudeCodeSettings)
+
+    def test_term_extraction_with_local_ollama(self):
+        settings = CLIEnvSettingsModel(
+            term_ollama=True,
+            term_ollama_detail={
+                "term_ollama_host": "http://192.168.1.10:11434/",
+                "term_ollama_model": "qwen2.5:14b",
+            },
+        ).to_settings_model()
+        settings.validate_settings()
+        assert isinstance(settings.term_extraction_engine_settings, OllamaSettings)
+        assert settings.term_extraction_engine_settings.ollama_host == (
+            "http://192.168.1.10:11434"
+        )
+        assert settings.translation.no_auto_extract_glossary is False
+
+    @pytest.mark.parametrize(
+        "host",
+        [None, "", "http://8.8.8.8:11434", "ftp://192.168.1.10", "192.168.1.10"],
+    )
+    def test_term_extraction_disabled_without_usable_ollama(self, host):
+        """Never falls back to Claude Code for term extraction."""
+        settings = CLIEnvSettingsModel(
+            term_ollama=True, term_ollama_detail={"term_ollama_host": host}
+        ).to_settings_model()
+        settings.validate_settings()
+        assert settings.term_extraction_engine_settings is None
+        assert settings.translation.no_auto_extract_glossary is True
+
+    def test_no_term_engine_disables_term_extraction(self):
+        settings = CLIEnvSettingsModel().to_settings_model()
+        settings.validate_settings()
+        assert settings.term_extraction_engine_settings is None
+        assert settings.translation.no_auto_extract_glossary is True
+
+    def test_ollama_host_is_local_only_in_gui(self):
+        assert "ollama_host" in GUI_LOCAL_ONLY_FIELDS
+        assert "claude_code_path" in GUI_LOCAL_ONLY_FIELDS
 
     def test_no_engine_selected_uses_claude_code(self):
         settings = CLIEnvSettingsModel().to_settings_model()
