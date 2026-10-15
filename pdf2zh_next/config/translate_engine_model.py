@@ -16,6 +16,11 @@ from pydantic import create_model
 GUI_SENSITIVE_FIELDS = []
 # any field in GUI_PASSWORD_FIELDS will be masked in GUI and treated as password
 GUI_PASSWORD_FIELDS = []
+# any field in GUI_LOCAL_ONLY_FIELDS is never shown in or accepted from the GUI;
+# it can only be set via CLI / env / config file. Used for fields that name a
+# local executable, since anyone who can reach the WebUI could otherwise run
+# arbitrary commands on the host.
+GUI_LOCAL_ONLY_FIELDS = []
 
 logger = logging.getLogger(__name__)
 
@@ -811,6 +816,7 @@ class AliyunDashScopeSettings(BaseModel):
 
 
 GUI_PASSWORD_FIELDS.append("aliyun_dashscope_api_key")
+GUI_SENSITIVE_FIELDS.append("aliyun_dashscope_base_url")
 
 
 class ClaudeCodeSettings(BaseModel):
@@ -827,6 +833,13 @@ class ClaudeCodeSettings(BaseModel):
     def validate_settings(self):
         if not self.claude_code_path:
             raise ValueError("Claude Code path is required")
+        # Passed to the CLI as a single argument; reject anything that is not a
+        # plain model name/alias so it cannot be read as another option.
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:\[\]-]*", self.claude_code_model):
+            raise ValueError(f"Invalid Claude Code model: {self.claude_code_model}")
+
+
+GUI_LOCAL_ONLY_FIELDS.append("claude_code_path")
 
 
 class CLISettings(BaseModel):
@@ -890,6 +903,10 @@ class CLISettings(BaseModel):
                 ) from e
             if not postprocess_parts:
                 raise ValueError("clitranslator_postprocess_command cannot be empty")
+
+
+GUI_LOCAL_ONLY_FIELDS.append("clitranslator_command")
+GUI_LOCAL_ONLY_FIELDS.append("clitranslator_postprocess_command")
 
 
 ## Please add the translator configuration class above this location.

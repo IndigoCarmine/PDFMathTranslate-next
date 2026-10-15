@@ -2,10 +2,16 @@ import asyncio
 import cgi
 import csv
 import io
+import ipaddress
+import json
 import logging
+import mimetypes
+import re
 import shutil
+import socket
 import tempfile
 import typing
+import urllib.parse
 import uuid
 import zipfile
 from enum import Enum
@@ -15,15 +21,20 @@ from string import Template
 import chardet
 import gradio as gr
 import requests
+import urllib3
 import yaml
 from babeldoc import __version__ as babeldoc_version
 from gradio_i18n import Translate
 from gradio_pdf import PDF
+from starlette.middleware import Middleware
+from starlette.routing import Mount
+from starlette.staticfiles import StaticFiles
 
 from pdf2zh_next import __version__
 from pdf2zh_next.config import ConfigManager
 from pdf2zh_next.config.cli_env_model import CLIEnvSettingsModel
 from pdf2zh_next.config.model import SettingsModel
+from pdf2zh_next.config.translate_engine_model import GUI_LOCAL_ONLY_FIELDS
 from pdf2zh_next.config.translate_engine_model import GUI_PASSWORD_FIELDS
 from pdf2zh_next.config.translate_engine_model import GUI_SENSITIVE_FIELDS
 from pdf2zh_next.config.translate_engine_model import TERM_EXTRACTION_ENGINE_METADATA
@@ -267,11 +278,19 @@ available_services = [x.translate_engine_type for x in TRANSLATION_ENGINE_METADA
 
 if settings.gui_settings.enabled_services:
     enabled_services = {
-        x.lower() for x in settings.gui_settings.enabled_services.split(",")
+        x.strip().lower() for x in settings.gui_settings.enabled_services.split(",")
     }
     available_services = [
         x for x in available_services if x.lower() in enabled_services
     ]
+
+# Term extraction engines are restricted by --enabled-services as well, so that
+# document text is only ever sent to services the operator has enabled.
+available_term_services = [
+    x.translate_engine_type
+    for x in TERM_EXTRACTION_ENGINE_METADATA
+    if x.translate_engine_type in available_services
+]
 
 assert available_services, "No translation service is enabled"
 
@@ -304,6 +323,110 @@ def _get_unique_dest_path(output_dir: Path, original_name: str) -> Path:
         index += 1
 
 
+_MAX_DOWNLOAD_REDIRECTS = 5
+# One message for every refused or failed connection, so the Link input
+# cannot be used to tell which internal hosts/ports exist.
+_DOWNLOAD_FAILED = "Could not download from this URL"
+_WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {
+    f"{d}{i}" for d in ("COM", "LPT") for i in range(1, 10)
+}
+
+
+def _is_public_ip(ip_str: str) -> bool:
+    ip = ipaddress.ip_address(ip_str.split("%", 1)[0])
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_global and not ip.is_multicast
+
+
+class _PublicOnlyConnectionMixin:
+    """Only lets urllib3 connect to public internet addresses.
+
+    The host urllib3 itself will connect to is resolved and checked before
+    connecting (so non-public hosts are never contacted, and closed/open ports
+    cannot be told apart), and the connected socket is checked again before
+    any request bytes are sent (so DNS rebinding cannot slip through either).
+    Redirects open new connections and go through the same checks.
+    """
+
+    def _new_conn(self):
+        try:
+            infos = socket.getaddrinfo(
+                self._dns_host, self.port, proto=socket.IPPROTO_TCP
+            )
+        except OSError as e:
+            raise gr.Error(_DOWNLOAD_FAILED) from e
+        addresses = [info[4][0] for info in infos]
+        if not addresses or not all(_is_public_ip(a) for a in addresses):
+            raise gr.Error(_DOWNLOAD_FAILED)
+        # Connect to the address checked above instead of resolving the name
+        # again, so DNS rebinding cannot change the target. TLS SNI and
+        # certificate checks still use the original host name.
+        try:
+            sock = urllib3.util.connection.create_connection(
+                (addresses[0], self.port),
+                self.timeout,
+                source_address=self.source_address,
+                socket_options=self.socket_options,
+            )
+        except OSError as e:
+            raise gr.Error(_DOWNLOAD_FAILED) from e
+        peer, local = sock.getpeername()[0], sock.getsockname()[0]
+        # Also refuse the host itself on one of its own public addresses
+        # (e.g. a global IPv6 address): then both ends share the address.
+        if not _is_public_ip(peer) or peer == local:
+            sock.close()
+            raise gr.Error(_DOWNLOAD_FAILED)
+        return sock
+
+
+class _PublicOnlyHTTPConnection(
+    _PublicOnlyConnectionMixin, urllib3.connection.HTTPConnection
+):
+    pass
+
+
+class _PublicOnlyHTTPSConnection(
+    _PublicOnlyConnectionMixin, urllib3.connection.HTTPSConnection
+):
+    pass
+
+
+class _PublicOnlyHTTPConnectionPool(urllib3.HTTPConnectionPool):
+    ConnectionCls = _PublicOnlyHTTPConnection
+
+
+class _PublicOnlyHTTPSConnectionPool(urllib3.HTTPSConnectionPool):
+    ConnectionCls = _PublicOnlyHTTPSConnection
+
+
+class _PublicOnlyAdapter(requests.adapters.HTTPAdapter):
+    def init_poolmanager(self, *args, **kwargs):
+        super().init_poolmanager(*args, **kwargs)
+        self.poolmanager.pool_classes_by_scheme = {
+            "http": _PublicOnlyHTTPConnectionPool,
+            "https": _PublicOnlyHTTPSConnectionPool,
+        }
+
+
+def _open_download(url: str) -> requests.Response:
+    """GET a user-supplied URL; only public internet hosts can be reached."""
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+        raise gr.Error("Only http(s) URLs are supported")
+    session = requests.Session()
+    # No proxies: through a proxy the connected peer would be the proxy, and
+    # the target address could not be checked.
+    session.trust_env = False
+    session.max_redirects = _MAX_DOWNLOAD_REDIRECTS
+    adapter = _PublicOnlyAdapter()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    try:
+        return session.get(url, stream=True, timeout=10)
+    except (gr.Error, requests.exceptions.ConnectionError) as e:
+        raise gr.Error(_DOWNLOAD_FAILED) from e
+
+
 def download_with_limit(url: str, save_path: str, size_limit: int = None) -> str:
     """
     This function downloads a file from a URL and saves it to a specified path.
@@ -318,7 +441,9 @@ def download_with_limit(url: str, save_path: str, size_limit: int = None) -> str
     """
     chunk_size = 1024
     total_size = 0
-    with requests.get(url, stream=True, timeout=10) as response:
+    response = _open_download(url)
+    url = response.url
+    with response:
         response.raise_for_status()
         content = response.headers.get("Content-Disposition")
         try:  # filename from header
@@ -326,7 +451,13 @@ def download_with_limit(url: str, save_path: str, size_limit: int = None) -> str
             filename = params["filename"]
         except Exception:  # filename from url
             filename = Path(url).name
-        filename = Path(filename).stem + ".pdf"
+        # Characters invalid in Windows file names (":" would even create an
+        # NTFS alternate data stream) are replaced.
+        stem = re.sub(r'[<>:"/\|?*\x00-\x1f]', "_", Path(filename).stem)
+        stem = stem.strip(" .") or "download"
+        if stem.upper() in _WINDOWS_RESERVED_NAMES:
+            stem = f"_{stem}"
+        filename = stem + ".pdf"
         save_path = Path(save_path).resolve()
 
         # Use a unique destination path to avoid overwriting existing files
@@ -560,7 +691,6 @@ def _build_translate_settings(
 
     # Advanced Translation Options
     min_text_length = ui_inputs.get("min_text_length")
-    rpc_doclayout = ui_inputs.get("rpc_doclayout")
     enable_auto_term_extraction = ui_inputs.get("enable_auto_term_extraction")
     primary_font_family = ui_inputs.get("primary_font_family")
 
@@ -630,8 +760,8 @@ def _build_translate_settings(
     # Update Translation Settings
     if min_text_length is not None:
         translate_settings.translation.min_text_length = int(min_text_length)
-    if rpc_doclayout:
-        translate_settings.translation.rpc_doclayout = rpc_doclayout
+    # rpc_doclayout is intentionally not taken from the UI: it sends rendered
+    # pages to the given host, so it may only be set via CLI / config file.
 
     # UI uses positive switch, config uses negative flag, so we invert here
     if enable_auto_term_extraction is not None:
@@ -687,7 +817,7 @@ def _build_translate_settings(
         term_service
         and term_service != "Follow main translation engine"
         and not translate_settings.translation.no_auto_extract_glossary
-        and term_service in TERM_EXTRACTION_ENGINE_METADATA_MAP
+        and term_service in available_term_services
     ):
         term_metadata = TERM_EXTRACTION_ENGINE_METADATA_MAP[term_service]
 
@@ -779,7 +909,9 @@ def _build_translate_settings(
         skip_formula_offset_calculation
     )
 
-    assert service in TRANSLATION_ENGINE_METADATA_MAP, "UNKNOW TRANSLATION ENGINE!"
+    # Gradio API calls can bypass the dropdown, so validate on the server side.
+    if service not in available_services:
+        raise gr.Error(f"Translation service is not enabled: {service}")
 
     for metadata in TRANSLATION_ENGINE_METADATA:
         cli_flag = metadata.cli_flag_name
@@ -793,6 +925,8 @@ def _build_translate_settings(
         if metadata.setting_model_type:
             for field_name in metadata.setting_model_type.model_fields:
                 if field_name == "translate_engine_type" or field_name == "support_llm":
+                    continue
+                if field_name in GUI_LOCAL_ONLY_FIELDS:
                     continue
                 if disable_gui_sensitive_input:
                     if field_name in GUI_PASSWORD_FIELDS:
@@ -2299,18 +2433,200 @@ custom_css = """
 # Build paths to resources
 current_dir = Path(__file__).parent
 assets_dir = current_dir / "assets"
-logo_path = assets_dir / "powered_by_siliconflow_light.png"
+# The app's static files (logo, pdf.js worker and CMaps) are served from
+# ASSETS_URL by a plain static route, so Gradio's /gradio_api/file= route does
+# not need any allowed_paths and cannot serve arbitrary files from the host.
+# The pdf.js worker and CMaps match the pdf.js 4.2.67 bundled in gradio_pdf
+# (from pdfjs-dist@4.2.67; see assets/pdfjs/LICENSE and cmaps/LICENSE).
+# gradio_pdf would load them from cdn.jsdelivr.net/gh/...@main and
+# huggingface.co; they are served locally so the browser does not hand
+# previewed PDFs to third-party scripts or hosts.
+ASSETS_URL = "/pdf2zh_assets"
+mimetypes.add_type("text/javascript", ".mjs")
 translation_file_path = current_dir / "gui_translation.yaml"
 config_fake_pdf_path = DEFAULT_CONFIG_DIR / "config.fake.pdf"
-_base_dir = Path.cwd().resolve()
-_drive_root = Path(_base_dir.anchor) if _base_dir.anchor else _base_dir
-pdf_preview_allowed_paths = [
-    logo_path,
-    Path("pdf2zh_files").resolve(),  # translation outputs
-    Path(tempfile.gettempdir()).resolve(),  # uploaded temp files
-    _base_dir,  # current working directory
-    _drive_root,  # drive root (Windows) or "/" (POSIX)
-]
+
+_GRADIO_PDF_CMAP_URL = (
+    "https://huggingface.co/datasets/freddyaboulton/bucket/resolve/main/cmaps/"
+)
+pdfjs_local_head = f"""
+<script>
+(function () {{
+    var cdn = {json.dumps(_GRADIO_PDF_CMAP_URL)};
+    var local = {json.dumps("." + ASSETS_URL + "/pdfjs/cmaps/")};
+    var originalFetch = window.fetch;
+    window.fetch = function (input, init) {{
+        var url = typeof input === "string" ? input : (input && input.url) || "";
+        if (url.indexOf(cdn) === 0) {{
+            var name = url.slice(cdn.length);
+            if (!/^[A-Za-z0-9_.-]+[.]bcmap$/.test(name)) {{
+                return Promise.reject(new TypeError("Blocked CMap request"));
+            }}
+            return originalFetch.call(this, local + name, init);
+        }}
+        return originalFetch.apply(this, arguments);
+    }};
+}})();
+</script>
+<script type="module">
+import * as pdfjsWorker from {json.dumps("." + ASSETS_URL + "/pdfjs/pdf.worker.min.mjs")};
+globalThis.pdfjsWorker = pdfjsWorker;
+</script>
+"""
+
+# The page may only load from and connect to this server. Any script running
+# in the page can read the uploaded and translated documents, so this blocks
+# sending them anywhere else from the browser (e.g. a CDN fallback of pdf.js).
+_CONTENT_SECURITY_POLICY = "; ".join(
+    [
+        "default-src 'self'",
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data: blob:",
+        "font-src 'self' data:",
+        "media-src 'self' data: blob:",
+        "connect-src 'self'",
+        "worker-src 'self' blob:",
+        "frame-src 'self' blob:",
+        "object-src 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+    ]
+)
+
+# A FileData "path" that is a URL makes Gradio download it on the server, and a
+# UNC path (\\host\share) makes Windows connect to that host over SMB while
+# Gradio checks the path. Uploads never need either.
+_REMOTE_FILE_PATH = re.compile(r"^\s*(?:[A-Za-z][A-Za-z0-9+.-]*:[/\\]{2}|[/\\]{2})")
+# Gradio's file routes check whether the requested path exists before checking
+# whether it may be served, so a UNC path there would also reach out over SMB.
+_REMOTE_FILE_ROUTE = re.compile(
+    r"^(?:/gradio_api)?/file[=/]\s*(?:[A-Za-z][A-Za-z0-9+.-]*:[/\\]{2}|[/\\]{2})"
+)
+
+
+def _has_remote_file_path(value) -> bool:
+    if isinstance(value, dict):
+        path = value.get("path")
+        if isinstance(path, str) and _REMOTE_FILE_PATH.match(path):
+            return True
+        return any(_has_remote_file_path(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_remote_file_path(v) for v in value)
+    return False
+
+
+class _WebUISecurityMiddleware:
+    """ASGI middleware hardening the Gradio app for LAN use.
+
+    - Adds a Content-Security-Policy to every response.
+    - Removes third-party resources from Gradio's HTML page: index.html loads
+      iframeResizer from cdnjs.cloudflare.com (only needed when embedded on
+      Hugging Face Spaces) and preconnects to Google Fonts.
+    - Rejects API requests whose file inputs point to a URL or a UNC path,
+      and file-route requests for UNC paths.
+    """
+
+    _EXTERNAL_TAGS = re.compile(
+        rb'<script\s+src="https://cdnjs\.cloudflare\.com/[^"]*"[^>]*>\s*</script>'
+        rb'|<link\s+rel="preconnect"\s+href="https://fonts\.(?:googleapis|gstatic)\.com"[^>]*>'
+    )
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        if _REMOTE_FILE_ROUTE.match(scope.get("path", "")):
+            await self._send_plain(send, 403, b"File not allowed")
+            return
+
+        request_headers = dict(scope.get("headers", []))
+        content_type = request_headers.get(b"content-type", b"").lower()
+        if scope["method"] == "POST" and not content_type.startswith(
+            b"multipart/form-data"
+        ):
+            chunks = []
+            while True:
+                message = await receive()
+                if message["type"] == "http.disconnect":
+                    return
+                chunks.append(message.get("body", b""))
+                if not message.get("more_body", False):
+                    break
+            body = b"".join(chunks)
+            try:
+                payload = json.loads(body) if body else None
+            except ValueError:
+                payload = None
+            if _has_remote_file_path(payload):
+                await self._send_plain(send, 400, b"Remote file paths are not allowed")
+                return
+
+            replayed = False
+
+            async def receive_replay():
+                nonlocal replayed
+                if not replayed:
+                    replayed = True
+                    return {"type": "http.request", "body": body, "more_body": False}
+                return await receive()
+
+            receive = receive_replay
+
+        start_message = None
+        html_body = []
+
+        async def send_wrapper(message):
+            nonlocal start_message
+            if message["type"] == "http.response.start":
+                headers = [
+                    (k, v)
+                    for k, v in message.get("headers", [])
+                    if k.lower() != b"content-security-policy"
+                ]
+                headers.append(
+                    (b"content-security-policy", _CONTENT_SECURITY_POLICY.encode())
+                )
+                message = {**message, "headers": headers}
+                if dict(headers).get(b"content-type", b"").startswith(b"text/html"):
+                    start_message = message
+                    return
+            elif message["type"] == "http.response.body" and start_message:
+                html_body.append(message.get("body", b""))
+                if message.get("more_body", False):
+                    return
+                content = self._EXTERNAL_TAGS.sub(b"", b"".join(html_body))
+                headers = [
+                    (k, v)
+                    for k, v in start_message["headers"]
+                    if k.lower() != b"content-length"
+                ]
+                headers.append((b"content-length", str(len(content)).encode()))
+                await send({**start_message, "headers": headers})
+                await send({"type": "http.response.body", "body": content})
+                return
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+    @staticmethod
+    async def _send_plain(send, status: int, text: bytes) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    (b"content-type", b"text/plain; charset=utf-8"),
+                    (b"content-length", str(len(text)).encode()),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": text})
+
 
 if not config_fake_pdf_path.exists():
     with config_fake_pdf_path.open("w") as f:
@@ -2327,7 +2643,7 @@ tech_details_string = f"""
                     - BabelDOC Version: {babeldoc_version}<br>
                     - Free translation service provided by <a href="https://siliconflow.cn/" target="_blank" style="text-decoration: none;">SiliconFlow</a><br>
                     <a href="https://siliconflow.cn/" target="_blank" style="text-decoration: none;">
-                        <img src="/gradio_api/file={logo_path}" alt="Powered By SiliconFlow" style="height: 40px; margin-top: 10px; background-color: #ffffff; padding: 4px; border-radius: 4px;">
+                        <img src="{ASSETS_URL}/powered_by_siliconflow_light.png" alt="Powered By SiliconFlow" style="height: 40px; margin-top: 10px; background-color: #ffffff; padding: 4px; border-radius: 4px;">
                     </a>
                     <br>
                 """
@@ -2336,9 +2652,21 @@ update_current_languages(settings.gui_settings.ui_lang)
 with gr.Blocks(
     title="PDFMathTranslate - PDF Translation with preserved formats",
     theme=gr.themes.Default(
-        primary_hue=custom_blue, spacing_size="md", radius_size="lg"
+        primary_hue=custom_blue,
+        spacing_size="md",
+        radius_size="lg",
+        # Installed system fonts instead of the default Google Fonts. gr.themes.Font
+        # only names a CSS font family; plain strings would be fetched as files.
+        font=[
+            gr.themes.Font("Segoe UI"),
+            gr.themes.Font("Helvetica Neue"),
+            gr.themes.Font("sans-serif"),
+        ],
+        font_mono=[gr.themes.Font("Consolas"), gr.themes.Font("monospace")],
     ),
     css=custom_css,
+    analytics_enabled=False,
+    head=pdfjs_local_head,
 ) as demo:
     lang_selector = gr.Dropdown(
         choices=LANGUAGES,
@@ -2514,6 +2842,8 @@ with gr.Blocks(
                                     field_name,
                                     field,
                                 ) in metadata.setting_model_type.model_fields.items():
+                                    if field_name in GUI_LOCAL_ONLY_FIELDS:
+                                        continue
                                     if disable_gui_sensitive_input:
                                         if field_name in GUI_SENSITIVE_FIELDS:
                                             continue
@@ -2657,16 +2987,18 @@ with gr.Blocks(
                                         "Follow main translation engine",
                                     )
                                 ]
-                                + [
-                                    metadata.translate_engine_type
-                                    for metadata in TERM_EXTRACTION_ENGINE_METADATA
-                                ],
+                                + available_term_services,
                                 value="Follow main translation engine",
                             )
 
                             # Term engine detail settings
                             __gui_term_service_arg_names = []
                             for term_metadata in TERM_EXTRACTION_ENGINE_METADATA:
+                                if (
+                                    term_metadata.translate_engine_type
+                                    not in available_term_services
+                                ):
+                                    continue
                                 if not term_metadata.cli_detail_field_name:
                                     continue
                                 term_detail_field_name = (
@@ -2700,6 +3032,8 @@ with gr.Blocks(
                                         else:
                                             base_name = base_field_name
 
+                                        if base_name in GUI_LOCAL_ONLY_FIELDS:
+                                            continue
                                         if disable_gui_sensitive_input:
                                             if base_name in GUI_SENSITIVE_FIELDS:
                                                 continue
@@ -2899,7 +3233,7 @@ with gr.Blocks(
 
                         rpc_doclayout = gr.Textbox(
                             label=_("RPC service for document layout analysis (optional)"),
-                            value=settings.translation.rpc_doclayout or "",
+                            value="",  # not sent to the browser; set via CLI / config only
                             visible=False,
                             interactive=True,
                             placeholder="http://host:port",
@@ -3200,7 +3534,7 @@ with gr.Blocks(
                     for line in csvreader:
                         if line:
                             glossary_list.append(line)
-            logger.warning(f"on_glossary_file_delete glossary_list {glossary_list}")
+            logger.debug(f"on_glossary_file_change: {len(glossary_list)} entries")
             if not glossary_list:
                 glossary_list = ["", "", ""]
             return gr.update(visible=True, value=glossary_list)
@@ -3605,7 +3939,10 @@ with gr.Blocks(
                 # Determine selected service by cli flag
                 selected_service = None
                 for metadata in TRANSLATION_ENGINE_METADATA:
-                    if getattr(fresh_settings, metadata.cli_flag_name, False):
+                    if (
+                        getattr(fresh_settings, metadata.cli_flag_name, False)
+                        and metadata.translate_engine_type in available_services
+                    ):
                         selected_service = metadata.translate_engine_type
                         break
                 if not selected_service:
@@ -3670,7 +4007,7 @@ with gr.Blocks(
                     gr.update(value=fresh_settings.translation.min_text_length)
                 )
                 updates.append(
-                    gr.update(value=fresh_settings.translation.rpc_doclayout or "")
+                    gr.update(value="")
                 )
                 updates.append(
                     gr.update(
@@ -3758,7 +4095,11 @@ with gr.Blocks(
                 selected_term_service = "Follow main translation engine"
                 for term_metadata in TERM_EXTRACTION_ENGINE_METADATA:
                     term_flag_name = f"term_{term_metadata.cli_flag_name}"
-                    if getattr(fresh_settings, term_flag_name, False):
+                    if (
+                        getattr(fresh_settings, term_flag_name, False)
+                        and term_metadata.translate_engine_type
+                        in available_term_services
+                    ):
                         selected_term_service = term_metadata.translate_engine_type
                         break
                 updates.append(gr.update(value=selected_term_service))
@@ -3799,6 +4140,8 @@ with gr.Blocks(
                         field_name,
                         field,
                     ) in metadata.setting_model_type.model_fields.items():
+                        if field_name in GUI_LOCAL_ONLY_FIELDS:
+                            continue
                         if disable_sensitive_gui:
                             if field_name in GUI_SENSITIVE_FIELDS:
                                 continue
@@ -3817,6 +4160,11 @@ with gr.Blocks(
 
                 # Term extraction engine detail fields (ordered)
                 for term_metadata in TERM_EXTRACTION_ENGINE_METADATA:
+                    if (
+                        term_metadata.translate_engine_type
+                        not in available_term_services
+                    ):
+                        continue
                     if not term_metadata.cli_detail_field_name:
                         continue
                     term_detail_field_name = (
@@ -3838,6 +4186,8 @@ with gr.Blocks(
                             base_name = base_field_name[len("term_") :]
                         else:
                             base_name = base_field_name
+                        if base_name in GUI_LOCAL_ONLY_FIELDS:
+                            continue
                         if disable_sensitive_gui:
                             if base_name in GUI_SENSITIVE_FIELDS:
                                 continue
@@ -3910,70 +4260,6 @@ with gr.Blocks(
             js="""
             (function() {
                 'use strict';
-
-            // Fix PDF worker URL - replace jsdelivr CDN with GitHub raw URL
-            function fixPDFWorkerURL() {
-                try {
-                    var originalWorkerSrc = 'https://cdn.jsdelivr.net/gh/freddyaboulton/gradio-pdf@main/pdf.worker.min.mjs';
-                    var newWorkerSrc = 'https://raw.githubusercontent.com/freddyaboulton/gradio-pdf/main/pdf.worker.min.mjs';
-                    
-                    // Method 1: Override PDF.js GlobalWorkerOptions if available
-                    if (typeof window !== 'undefined') {
-                        if (window.pdfjsLib && window.pdfjsLib.GlobalWorkerOptions) {
-                            window.pdfjsLib.GlobalWorkerOptions.workerSrc = newWorkerSrc;
-                        }
-                        
-                        // Method 2: Use MutationObserver to intercept script execution
-                        var observer = new MutationObserver(function(mutations) {
-                            mutations.forEach(function(mutation) {
-                                mutation.addedNodes.forEach(function(node) {
-                                    if (node.nodeType === 1) { // Element node
-                                        if (node.tagName === 'SCRIPT') {
-                                            if (node.textContent && node.textContent.indexOf(originalWorkerSrc) !== -1) {
-                                                var escapedUrl = originalWorkerSrc.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
-                                                node.textContent = node.textContent.replace(new RegExp(escapedUrl, 'g'), newWorkerSrc);
-                                            }
-                                        }
-                                        // Also check for inline scripts in the node
-                                        var scripts = node.querySelectorAll && node.querySelectorAll('script');
-                                        if (scripts) {
-                                            for (var i = 0; i < scripts.length; i++) {
-                                                if (scripts[i].textContent && scripts[i].textContent.indexOf(originalWorkerSrc) !== -1) {
-                                                    var escapedUrl2 = originalWorkerSrc.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
-                                                    scripts[i].textContent = scripts[i].textContent.replace(new RegExp(escapedUrl2, 'g'), newWorkerSrc);
-                                                }
-                                            }
-                                        }
-                                    }
-                                });
-                            });
-                        });
-                        observer.observe(document.body || document.documentElement, {
-                            childList: true,
-                            subtree: true
-                        });
-                        
-                        // Method 3: Intercept fetch requests for the worker file
-                        var originalFetch = window.fetch;
-                        window.fetch = function() {
-                            var url = arguments[0];
-                            if (typeof url === 'string' && url.indexOf(originalWorkerSrc) !== -1) {
-                                arguments[0] = url.replace(originalWorkerSrc, newWorkerSrc);
-                            }
-                            return originalFetch.apply(this, arguments);
-                        };
-                    }
-                } catch (e) {
-                    console.warn('Failed to fix PDF worker URL:', e);
-                }
-            }
-            
-            // Run fix immediately and also on DOM ready
-            if (document.readyState === 'loading') {
-                document.addEventListener('DOMContentLoaded', fixPDFWorkerURL);
-            } else {
-                fixPDFWorkerURL();
-            }
 
             function adjustPDFCanvasScale() {
                     var previewContainers = document.querySelectorAll('.pdf-preview-fixed');
@@ -4129,80 +4415,29 @@ def setup_gui(
 
     user_list, html = parse_user_passwd(auth_file, welcome_page)
 
-    if not auth_file or not user_list:
-        try:
-            demo.launch(
-                server_name="0.0.0.0",
-                debug=True,
-                inbrowser=inbrowser,
-                share=share,
-                server_port=server_port,
-                allowed_paths=[str(p) for p in pdf_preview_allowed_paths],
-            )
-        except Exception:
-            print(
-                "Error launching GUI using 0.0.0.0.\nThis may be caused by global mode of proxy software."
-            )
-            try:
-                demo.launch(
-                    server_name="127.0.0.1",
-                    debug=True,
-                    inbrowser=inbrowser,
-                    share=share,
-                    server_port=server_port,
-                    allowed_paths=[str(p) for p in pdf_preview_allowed_paths],
-                )
-            except Exception:
-                print(
-                    "Error launching GUI using 127.0.0.1.\nThis may be caused by global mode of proxy software."
-                )
-                demo.launch(
-                    debug=True,
-                    inbrowser=inbrowser,
-                    share=True,
-                    server_port=server_port,
-                    allowed_paths=[str(p) for p in pdf_preview_allowed_paths],
-                )
-    else:
-        try:
-            demo.launch(
-                server_name="0.0.0.0",
-                debug=True,
-                inbrowser=inbrowser,
-                share=share,
-                auth=user_list,
-                auth_message=html,
-                server_port=server_port,
-                allowed_paths=[str(p) for p in pdf_preview_allowed_paths],
-            )
-        except Exception:
-            print(
-                "Error launching GUI using 0.0.0.0.\nThis may be caused by global mode of proxy software."
-            )
-            try:
-                demo.launch(
-                    server_name="127.0.0.1",
-                    debug=True,
-                    inbrowser=inbrowser,
-                    share=share,
-                    auth=user_list,
-                    auth_message=html,
-                    server_port=server_port,
-                    allowed_paths=[str(p) for p in pdf_preview_allowed_paths],
-                )
-            except Exception:
-                print(
-                    "Error launching GUI using 127.0.0.1.\nThis may be caused by global mode of proxy software."
-                )
-                demo.launch(
-                    debug=True,
-                    inbrowser=inbrowser,
-                    share=True,
-                    auth=user_list,
-                    auth_message=html,
-                    server_port=server_port,
-                    allowed_paths=[str(p) for p in pdf_preview_allowed_paths],
-                )
+    launch_kwargs = {
+        "debug": True,
+        "inbrowser": inbrowser,
+        "share": share,
+        "server_port": server_port,
+        "app_kwargs": {
+            "middleware": [Middleware(_WebUISecurityMiddleware)],
+            "routes": [Mount(ASSETS_URL, app=StaticFiles(directory=assets_dir))],
+        },
+    }
+    if auth_file and user_list:
+        launch_kwargs["auth"] = user_list
+        launch_kwargs["auth_message"] = html
+
+    try:
+        demo.launch(server_name="0.0.0.0", **launch_kwargs)
+    except Exception:
+        print(
+            "Error launching GUI using 0.0.0.0.\nThis may be caused by global mode of proxy software."
+        )
+        # Never fall back to share=True here: that would publish the WebUI
+        # (and the files it serves) to the internet via a gradio.live tunnel.
+        demo.launch(server_name="127.0.0.1", **launch_kwargs)
 
 
 # For auto-reloading while developing

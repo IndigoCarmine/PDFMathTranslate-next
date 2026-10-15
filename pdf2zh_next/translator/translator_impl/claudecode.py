@@ -1,7 +1,10 @@
 import json
 import logging
 import os
+import shutil
 import subprocess
+import tempfile
+from pathlib import Path
 
 from pdf2zh_next.config.model import SettingsModel
 from pdf2zh_next.translator.base_rate_limiter import BaseRateLimiter
@@ -25,6 +28,11 @@ class ClaudeCodeTranslator(BaseTranslator):
     ):
         super().__init__(settings, rate_limiter)
         self.claude_code_path = settings.translate_engine_settings.claude_code_path
+        # Resolve now: the CLI is later started in a temporary directory, where a
+        # relative path would no longer resolve.
+        self.claude_code_path = shutil.which(self.claude_code_path) or str(
+            Path(self.claude_code_path).resolve()
+        )
         self.claude_code_model = settings.translate_engine_settings.claude_code_model
         self.add_cache_impact_parameters("model", self.claude_code_model)
         self.add_cache_impact_parameters("prompt", self.prompt(""))
@@ -57,11 +65,19 @@ class ClaudeCodeTranslator(BaseTranslator):
         messages = self.prompt(text)
         input_data = json.dumps({"type": "user", "message": messages[0]})
 
+        # The text comes from the PDF and may contain prompt injection, so run
+        # without any tools: no built-in tools (--tools "") and none of the
+        # user's MCP servers (--strict-mcp-config without --mcp-config). The
+        # document can then only go to the model, not to the web, files or
+        # connected services. Also keep host context out of the model's view
+        # (and so out of the translated output): replace the default system
+        # prompt (cwd, env info, git status), load no settings/hooks
+        # (--setting-sources=) or CLAUDE.md files, run in an empty directory
+        # and do not save the session to disk.
         cmd = [
             self.claude_code_path,
             "-p",
-            "--model",
-            self.claude_code_model,
+            f"--model={self.claude_code_model}",
             "--max-turns",
             "1",
             "--input-format",
@@ -69,25 +85,44 @@ class ClaudeCodeTranslator(BaseTranslator):
             "--output-format",
             "stream-json",
             "--verbose",
+            "--tools",
+            "",
+            "--strict-mcp-config",
+            "--setting-sources=",
+            "--no-session-persistence",
+            "--system-prompt",
+            "You are a translation engine. Follow the user's instructions.",
             "--disallowedTools",
-            "Task Bash Glob Grep LS exit_plan_mode Read Edit MultiEdit Write NotebookRead NotebookEdit TodoRead TodoWrite",
+            "Task Bash Glob Grep LS exit_plan_mode Read Edit MultiEdit Write NotebookRead NotebookEdit TodoRead TodoWrite WebFetch WebSearch",
         ]
 
         env = os.environ.copy()
         env.pop("ANTHROPIC_API_KEY", None)
+        env["CLAUDE_CODE_DISABLE_CLAUDE_MDS"] = "1"
+        env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
 
         try:
-            logger.info(f"Running Claude Code: {cmd}\n{input_data}")
-            process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env,
-            )
+            logger.debug(f"Running Claude Code: {cmd}\n{input_data}")
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as workdir:
+                process = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=env,
+                    cwd=workdir,
+                )
 
-            stdout, stderr = process.communicate(input=input_data, timeout=120)
+                try:
+                    stdout, stderr = process.communicate(input=input_data, timeout=120)
+                except subprocess.TimeoutExpired:
+                    # Kill before leaving the block so the directory can be removed
+                    process.kill()
+                    process.communicate()
+                    raise
             logger.debug(f"CC: {stdout}")
 
             if process.returncode != 0:
@@ -98,7 +133,6 @@ class ClaudeCodeTranslator(BaseTranslator):
             return translation.strip()
 
         except subprocess.TimeoutExpired as e:
-            process.kill()
             raise ValueError("Claude Code translation timed out") from e
 
     def _parse_output(self, output: str) -> str:
