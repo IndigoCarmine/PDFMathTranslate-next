@@ -148,7 +148,7 @@ class TestConfigManager:
             debug=True,
             report_interval=MagicDefault,  # Should use env var
             qps=15,  # Should override env var
-            google=True,
+            claudecode=True,
         )
 
         # Initialize configuration
@@ -554,72 +554,21 @@ class TestConfigManager:
         assert read_content["basic"]["debug"] is True
         assert read_content["translation"]["qps"] == 15
 
-    def test_merge_settings_translation_engine_priority(self):
-        """Higher priority config should determine translation engine"""
+    def test_merge_settings_only_claude_code_flags(self):
+        """Removed engines are no longer engine flags and cannot be selected"""
+        from pdf2zh_next.config.main import _term_translation_engine_flag_names
+        from pdf2zh_next.config.main import _translation_engine_flag_names
+
+        assert _translation_engine_flag_names == ["claudecode"]
+        assert _term_translation_engine_flag_names == ["term_ollama"]
+
         cm = ConfigManager()
-
-        cli_args = {
-            "google": True,
-        }
-        env_vars = {
-            "bing": True,
-        }
-        default_config = {
-            "openai": True,
-        }
-
-        result = cm.merge_settings([cli_args, env_vars, default_config])
-
-        # Only the highest-priority engine (from CLI) should be enabled
-        assert result.get("google") is True
-        assert result.get("bing") is not True
-        assert result.get("openai") is not True
-
-    def test_merge_settings_term_engine_priority(self):
-        """Higher priority config should determine term translation engine"""
-        cm = ConfigManager()
-
-        cli_args = {
-            "term_openai": True,
-        }
-        env_vars = {
-            "term_deepseek": True,
-        }
-        default_config = {
-            "term_ollama": True,
-        }
-
-        result = cm.merge_settings([cli_args, env_vars, default_config])
-
-        # Only the highest-priority term engine (from CLI) should be enabled
-        assert result.get("term_openai") is True
-        assert result.get("term_deepseek") is not True
-        assert result.get("term_ollama") is not True
-
-    def test_merge_settings_translation_and_term_engine_independence(self):
-        """Translation and term engines should be chosen independently"""
-        cm = ConfigManager()
-
-        # CLI selects translation engine only
-        cli_args = {
-            "google": True,
-        }
-        # Env selects term engine only
-        env_vars = {
-            "term_openai": True,
-        }
-        # Default config selects different engines
-        default_config = {
-            "openai": True,
-            "term_deepseek": True,
-        }
-
-        result = cm.merge_settings([cli_args, env_vars, default_config])
-
-        # Translation engine should come from CLI
-        assert result.get("google") is True
-        assert result.get("openai") is not True
-
-        # Term engine should come from env
-        assert result.get("term_openai") is True
-        assert result.get("term_deepseek") is not True
+        result = cm.merge_settings(
+            [
+                {"google": True},
+                {"term_openai": True},
+                {"claudecode": True, "term_ollama": True},
+            ]
+        )
+        assert result.get("claudecode") is True
+        assert result.get("term_ollama") is True

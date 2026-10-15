@@ -510,23 +510,22 @@ def create_babeldoc_config(settings: SettingsModel, file: Path) -> BabelDOCConfi
     if translator is None:
         raise ValueError("No translator found")
 
-    if (
-        settings.term_extraction_engine_settings == settings.translate_engine_settings
-        and settings.translation.term_qps == settings.translation.qps
-    ):
-        term_extraction_translator = translator
-        if recommended_qps := getattr(translator, "pdf2zh_next_recommended_qps", None):
-            settings.translation.term_qps = recommended_qps
-            logger.info(f"Updated term qps to {recommended_qps}")
-        if recommended_pool_max_workers := getattr(
-            translator, "pdf2zh_next_recommended_pool_max_workers", None
-        ):
-            settings.translation.term_pool_max_workers = recommended_pool_max_workers
-            logger.info(
-                f"Updated term pool max workers to {recommended_pool_max_workers}"
+    # Term extraction never uses the main translator (Claude Code). It only runs
+    # with the dedicated term extraction engine (a local network Ollama server)
+    # and is skipped when that is not configured or cannot be reached. BabelDOC
+    # would fall back to the main translator if auto extraction stayed on
+    # without a term extraction translator, so it is switched off here.
+    term_extraction_translator = None
+    if not settings.translation.no_auto_extract_glossary:
+        try:
+            term_extraction_translator = get_term_translator(settings)
+        except Exception as e:
+            logger.warning(
+                f"Term extraction engine is not available, automatic term "
+                f"extraction will be disabled: {e}"
             )
-    else:
-        term_extraction_translator = get_term_translator(settings)
+    if term_extraction_translator is None:
+        settings.translation.no_auto_extract_glossary = True
 
     # 设置分割策略
     split_strategy = None

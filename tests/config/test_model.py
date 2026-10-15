@@ -5,8 +5,11 @@ from pdf2zh_next.config.cli_env_model import CLIEnvSettingsModel
 from pdf2zh_next.config.model import BasicSettings
 from pdf2zh_next.config.model import PDFSettings
 from pdf2zh_next.config.model import TranslationSettings
-from pdf2zh_next.config.translate_engine_model import CLISettings
-from pdf2zh_next.config.translate_engine_model import OpenAISettings
+from pdf2zh_next.config.translate_engine_model import GUI_LOCAL_ONLY_FIELDS
+from pdf2zh_next.config.translate_engine_model import TERM_EXTRACTION_ENGINE_METADATA
+from pdf2zh_next.config.translate_engine_model import TRANSLATION_ENGINE_METADATA
+from pdf2zh_next.config.translate_engine_model import ClaudeCodeSettings
+from pdf2zh_next.config.translate_engine_model import OllamaSettings
 
 
 class TestBasicSettings:
@@ -16,8 +19,6 @@ class TestBasicSettings:
         assert settings.input_files == set()
         assert settings.debug is False
         assert settings.warmup is False
-        # rpc_doclayout has been moved to TranslationSettings
-        # assert settings.rpc_doclayout is None
         assert settings.generate_offline_assets is None
         assert settings.restore_offline_assets is None
 
@@ -110,23 +111,20 @@ class TestPDFSettings:
         """Test watermark mode validation"""
         # Valid modes
         settings = CLIEnvSettingsModel(
-            openai=True,
-            openai_detail={"openai_api_key": "test-key"},
+            claudecode=True,
             pdf={"watermark_output_mode": "no_watermark"},
         ).to_settings_model()
         assert settings.pdf.watermark_output_mode == "no_watermark"
 
         settings = CLIEnvSettingsModel(
-            openai=True,
-            openai_detail={"openai_api_key": "test-key"},
+            claudecode=True,
             pdf={"watermark_output_mode": "both"},
         ).to_settings_model()
         assert settings.pdf.watermark_output_mode == "both"
 
         # Invalid mode will be caught in validate_settings, not during initialization
         settings = CLIEnvSettingsModel(
-            openai=True,
-            openai_detail={"openai_api_key": "test-key"},
+            claudecode=True,
             pdf={"watermark_output_mode": "invalid"},
         ).to_settings_model()
         with pytest.raises(ValueError, match="Invalid watermark output mode"):
@@ -135,8 +133,7 @@ class TestPDFSettings:
     def test_output_modes_mutual_exclusion(self):
         """Test mutual exclusion of PDF output modes"""
         settings = CLIEnvSettingsModel(
-            openai=True,
-            openai_detail={"openai_api_key": "test-key"},
+            claudecode=True,
             pdf={"no_dual": True, "no_mono": True},
         )
         with pytest.raises(
@@ -148,8 +145,7 @@ class TestPDFSettings:
         """Test formula pattern validation"""
         # Test invalid font pattern
         settings = CLIEnvSettingsModel(
-            openai=True,
-            openai_detail={"openai_api_key": "test-key"},
+            claudecode=True,
             pdf={"formular_font_pattern": "["},
         )
         with pytest.raises(ValueError, match="Invalid formular_font_pattern"):
@@ -157,8 +153,7 @@ class TestPDFSettings:
 
         # Test invalid char pattern
         settings = CLIEnvSettingsModel(
-            openai=True,
-            openai_detail={"openai_api_key": "test-key"},
+            claudecode=True,
             pdf={"formular_char_pattern": "["},
         )
         with pytest.raises(ValueError, match="Invalid formular_char_pattern"):
@@ -166,8 +161,7 @@ class TestPDFSettings:
 
         # Test valid patterns
         settings = CLIEnvSettingsModel(
-            openai=True,
-            openai_detail={"openai_api_key": "test-key"},
+            claudecode=True,
             pdf={"formular_font_pattern": r"\w+", "formular_char_pattern": r"\d+"},
         )
         settings.validate_settings()  # Should not raise any error
@@ -176,8 +170,7 @@ class TestPDFSettings:
         """Test page split related settings"""
         # Test invalid max_pages_per_part
         settings = CLIEnvSettingsModel(
-            openai=True,
-            openai_detail={"openai_api_key": "test-key"},
+            claudecode=True,
             pdf={"max_pages_per_part": -1},
         )
         with pytest.raises(
@@ -187,8 +180,7 @@ class TestPDFSettings:
 
         # Test invalid short_line_split_factor
         settings = CLIEnvSettingsModel(
-            openai=True,
-            openai_detail={"openai_api_key": "test-key"},
+            claudecode=True,
             pdf={"split_short_lines": True, "short_line_split_factor": 0.05},
         )
         with pytest.raises(
@@ -198,115 +190,95 @@ class TestPDFSettings:
             settings.validate_settings()
 
 
-class TestOpenAISettings:
-    def test_default_values(self):
-        """Test default values of OpenAISettings"""
-        settings = OpenAISettings()
-        assert settings.openai_model == "gpt-4o-mini"
-        assert settings.openai_base_url is None
-        assert settings.openai_api_key is None
+class TestClaudeCodeOnly:
+    """Document content may only leave the machine through the Claude Code CLI
+    (or, for term extraction only, go to an Ollama server on the local network)."""
 
-    def test_alias_fields(self):
-        """Test alias field names work correctly"""
-        settings = OpenAISettings(
-            openai_model="gpt-4",
-            **{
-                "openai_base_url": "http://api.example.com",
-                "openai_api_key": "test-key",
-            },
-        )
-        assert settings.openai_model == "gpt-4"
-        assert settings.openai_base_url == "http://api.example.com"
-        assert settings.openai_api_key == "test-key"
+    def test_claude_code_is_the_only_engine(self):
+        assert [m.translate_engine_type for m in TRANSLATION_ENGINE_METADATA] == [
+            "ClaudeCode"
+        ]
+        assert [m.translate_engine_type for m in TERM_EXTRACTION_ENGINE_METADATA] == [
+            "Ollama"
+        ]
 
-
-class TestCLISettings:
-    def test_valid_command_with_args_and_stdin_default(self):
-        settings = CLISettings(
-            clitranslator_command="your-translator-command --flag value"
-        )
-        settings.validate_settings()
-
-    def test_requires_command(self):
-        settings = CLISettings(clitranslator_command="")
-        with pytest.raises(ValueError, match="CLI command is required"):
-            settings.validate_settings()
-
-    def test_invalid_cli_command(self):
-        settings = CLISettings(
-            clitranslator_command="your-translator-command 'unterminated"
-        )
-        with pytest.raises(ValueError, match="Invalid clitranslator_command"):
-            settings.validate_settings()
-
-    def test_valid_postprocess_command(self):
-        settings = CLISettings(
-            clitranslator_command="your-translator-command",
-            clitranslator_postprocess_command="jq -r .result.translation",
-        )
-        settings.validate_settings()
-
-    def test_invalid_postprocess_command(self):
-        settings = CLISettings(
-            clitranslator_command="your-translator-command",
-            clitranslator_postprocess_command="jq 'unterminated",
-        )
-        with pytest.raises(
-            ValueError, match="Invalid clitranslator_postprocess_command"
-        ):
-            settings.validate_settings()
-
-    def test_base_url_handling(self):
-        """Test base URL handling"""
-        # Test URL with /chat/completions/ suffix
+    def test_ollama_cannot_be_the_translation_engine(self):
         settings = CLIEnvSettingsModel(
-            openai=True,
-            openai_detail={
-                "openai_api_key": "test-key",
-                "openai_base_url": "http://api.example.com/chat/completions/",
+            ollama=True, ollama_detail={"ollama_host": "http://192.168.1.10:11434"}
+        ).to_settings_model()
+        assert isinstance(settings.translate_engine_settings, ClaudeCodeSettings)
+
+    def test_term_extraction_with_local_ollama(self):
+        settings = CLIEnvSettingsModel(
+            term_ollama=True,
+            term_ollama_detail={
+                "term_ollama_host": "http://192.168.1.10:11434/",
+                "term_ollama_model": "qwen2.5:14b",
             },
         ).to_settings_model()
-        # Store original URL
-        original_url = settings.translate_engine_settings.openai_base_url
         settings.validate_settings()
-        # URL should be modified after validation
-        assert original_url == "http://api.example.com/chat/completions/"
-        assert (
-            settings.translate_engine_settings.openai_base_url
-            == "http://api.example.com"
+        assert isinstance(settings.term_extraction_engine_settings, OllamaSettings)
+        assert settings.term_extraction_engine_settings.ollama_host == (
+            "http://192.168.1.10:11434"
         )
+        assert settings.translation.no_auto_extract_glossary is False
 
-        # Test URL contains /chat/completions/
+    @pytest.mark.parametrize(
+        "host",
+        [None, "", "http://8.8.8.8:11434", "ftp://192.168.1.10", "192.168.1.10"],
+    )
+    def test_term_extraction_disabled_without_usable_ollama(self, host):
+        """Never falls back to Claude Code for term extraction."""
         settings = CLIEnvSettingsModel(
-            openai=True,
-            openai_detail={
-                "openai_api_key": "test-key",
-                "openai_base_url": "http://api.example.com/chat/completions/anything",
-            },
+            term_ollama=True, term_ollama_detail={"term_ollama_host": host}
         ).to_settings_model()
-        # Store original URL
-        original_url = settings.translate_engine_settings.openai_base_url
         settings.validate_settings()
-        # URL should be modified after validation
-        assert original_url == "http://api.example.com/chat/completions/anything"
-        assert (
-            settings.translate_engine_settings.openai_base_url
-            == "http://api.example.com/chat/completions/anything"
-        )
+        assert settings.term_extraction_engine_settings is None
+        assert settings.translation.no_auto_extract_glossary is True
 
-        # Test URL without /chat/completions/ suffix
-        settings = CLIEnvSettingsModel(
-            openai=True,
-            openai_detail={
-                "openai_api_key": "test-key",
-                "openai_base_url": "http://api.example.com",
-            },
-        )
-        original_url = settings.openai_detail.openai_base_url
+    def test_no_term_engine_disables_term_extraction(self):
+        settings = CLIEnvSettingsModel().to_settings_model()
         settings.validate_settings()
-        # URL should remain unchanged
-        assert original_url == "http://api.example.com"
-        assert settings.openai_detail.openai_base_url == "http://api.example.com"
+        assert settings.term_extraction_engine_settings is None
+        assert settings.translation.no_auto_extract_glossary is True
+
+    def test_ollama_host_is_local_only_in_gui(self):
+        assert "ollama_host" in GUI_LOCAL_ONLY_FIELDS
+        assert "claude_code_path" in GUI_LOCAL_ONLY_FIELDS
+
+    def test_no_engine_selected_uses_claude_code(self):
+        settings = CLIEnvSettingsModel().to_settings_model()
+        assert isinstance(settings.translate_engine_settings, ClaudeCodeSettings)
+
+    def test_claude_code_detail_used_without_flag(self):
+        settings = CLIEnvSettingsModel(
+            claudecode_detail={"claude_code_model": "haiku"}
+        ).to_settings_model()
+        assert settings.translate_engine_settings.claude_code_model == "haiku"
+
+    def test_removed_engine_options_are_ignored(self):
+        """Old config files may still enable removed engines; they must not apply."""
+        settings = CLIEnvSettingsModel(
+            siliconflowfree=True,
+            openai=True,
+            openai_detail={"openai_api_key": "test-key"},
+            term_openai=True,
+            clitranslator=True,
+            translation={"rpc_doclayout": "http://example.com:8000"},
+            gui_settings={"share": True},
+        ).to_settings_model()
+        settings.validate_settings()
+        assert isinstance(settings.translate_engine_settings, ClaudeCodeSettings)
+        assert settings.term_extraction_engine_settings is None
+        assert not hasattr(settings.translation, "rpc_doclayout")
+        assert not hasattr(settings.gui_settings, "share")
+
+    def test_invalid_model_name(self):
+        settings = ClaudeCodeSettings(
+            claude_code_model="--dangerously-skip-permissions"
+        )
+        with pytest.raises(ValueError, match="Invalid Claude Code model"):
+            settings.validate_settings()
 
 
 class TestCLIEnvSettingsModel:
@@ -315,11 +287,11 @@ class TestCLIEnvSettingsModel:
         settings = CLIEnvSettingsModel()
         assert settings.config_file is None
         assert settings.report_interval == 0.1
-        assert settings.openai is False
+        assert settings.claudecode is False
         assert isinstance(settings.basic, BasicSettings)
         assert isinstance(settings.translation, TranslationSettings)
         assert isinstance(settings.pdf, PDFSettings)
-        assert isinstance(settings.openai_detail, OpenAISettings)
+        assert isinstance(settings.claudecode_detail, ClaudeCodeSettings)
 
     def test_get_output_dir(self, tmp_path: Path):
         """Test get_output_dir method"""
@@ -345,15 +317,15 @@ class TestCLIEnvSettingsModel:
         settings = CLIEnvSettingsModel()
         settings.validate_settings()
 
-        # Test missing OpenAI API key
-        settings = CLIEnvSettingsModel(openai=True)
-        with pytest.raises(ValueError, match="OpenAI API key is required"):
+        # Test empty Claude Code path
+        settings = CLIEnvSettingsModel(
+            claudecode=True, claudecode_detail={"claude_code_path": ""}
+        )
+        with pytest.raises(ValueError, match="Claude Code path is required"):
             settings.validate_settings()
 
-        # Test valid OpenAI settings
-        settings = CLIEnvSettingsModel(
-            openai=True, openai_detail={"openai_api_key": "test-key"}
-        )
+        # Test valid Claude Code settings
+        settings = CLIEnvSettingsModel(claudecode=True)
 
         # Create a test PDF file
         test_pdf = tmp_path / "test.pdf"
@@ -364,8 +336,7 @@ class TestCLIEnvSettingsModel:
 
         # Test invalid input file
         settings = CLIEnvSettingsModel(
-            openai=True,
-            openai_detail={"openai_api_key": "test-key"},
+            claudecode=True,
             basic={"input_files": {"nonexistent.pdf"}},
         )
         with pytest.raises(ValueError, match="File does not exist"):
@@ -375,8 +346,7 @@ class TestCLIEnvSettingsModel:
         non_pdf = tmp_path / "test.txt"
         non_pdf.touch()
         settings = CLIEnvSettingsModel(
-            openai=True,
-            openai_detail={"openai_api_key": "test-key"},
+            claudecode=True,
             basic={"input_files": {str(non_pdf)}},
         )
         with pytest.raises(ValueError, match="File is not a PDF file"):
@@ -412,8 +382,7 @@ class TestCLIEnvSettingsModel:
     def test_enhance_compatibility_effects(self):
         """Test enhance_compatibility setting effects"""
         settings = CLIEnvSettingsModel(
-            openai=True,
-            openai_detail={"openai_api_key": "test-key"},
+            claudecode=True,
             pdf={"enhance_compatibility": True},
         ).to_settings_model()
         settings.validate_settings()
@@ -424,8 +393,7 @@ class TestCLIEnvSettingsModel:
         """Test boundary value validations"""
         # Test QPS validation
         settings = CLIEnvSettingsModel(
-            openai=True,
-            openai_detail={"openai_api_key": "test-key"},
+            claudecode=True,
             translation={"qps": 0},
         )
         with pytest.raises(ValueError, match="qps must be greater than 0"):
@@ -433,8 +401,7 @@ class TestCLIEnvSettingsModel:
 
         # Test min_text_length validation
         settings = CLIEnvSettingsModel(
-            openai=True,
-            openai_detail={"openai_api_key": "test-key"},
+            claudecode=True,
             translation={"min_text_length": -1},
         )
         with pytest.raises(
@@ -444,8 +411,7 @@ class TestCLIEnvSettingsModel:
 
         # Test report_interval validation
         settings = CLIEnvSettingsModel(
-            openai=True,
-            openai_detail={"openai_api_key": "test-key"},
+            claudecode=True,
             report_interval=0.04,
         )
         with pytest.raises(
