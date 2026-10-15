@@ -1,22 +1,5 @@
-from pdf2zh_next.config import AnythingLLMSettings
-from pdf2zh_next.config import AzureOpenAISettings
-from pdf2zh_next.config import AzureSettings
-from pdf2zh_next.config import BingSettings
-from pdf2zh_next.config import DeepLSettings
-from pdf2zh_next.config import DeepSeekSettings
-from pdf2zh_next.config import DifySettings
-from pdf2zh_next.config import GeminiSettings
-from pdf2zh_next.config import GoogleSettings
-from pdf2zh_next.config import GrokSettings
-from pdf2zh_next.config import GroqSettings
-from pdf2zh_next.config import ModelScopeSettings
-from pdf2zh_next.config import OllamaSettings
-from pdf2zh_next.config import OpenAISettings
-from pdf2zh_next.config import QwenMtSettings
-from pdf2zh_next.config import SiliconFlowSettings
-from pdf2zh_next.config import TencentSettings
-from pdf2zh_next.config import XinferenceSettings
-from pdf2zh_next.config import ZhipuSettings
+from pdf2zh_next import _egress_policy  # noqa: F401  # must be imported first
+from pdf2zh_next.config import ClaudeCodeSettings
 from pdf2zh_next.config.main import ConfigManager
 from pdf2zh_next.config.model import BasicSettings
 from pdf2zh_next.config.model import PDFSettings
@@ -39,25 +22,6 @@ __email__ = "aw@funstory.ai"
 __all__ = [
     "SettingsModel",
     "BasicSettings",
-    "OpenAISettings",
-    "BingSettings",
-    "GoogleSettings",
-    "DeepLSettings",
-    "DeepSeekSettings",
-    "OllamaSettings",
-    "XinferenceSettings",
-    "AzureOpenAISettings",
-    "ModelScopeSettings",
-    "ZhipuSettings",
-    "SiliconFlowSettings",
-    "TencentSettings",
-    "GeminiSettings",
-    "AzureSettings",
-    "AnythingLLMSettings",
-    "DifySettings",
-    "GrokSettings",
-    "GroqSettings",
-    "QwenMtSettings",
     "PDFSettings",
     "TranslationSettings",
     "WatermarkOutputMode",

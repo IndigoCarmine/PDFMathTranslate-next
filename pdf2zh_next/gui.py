@@ -760,8 +760,6 @@ def _build_translate_settings(
     # Update Translation Settings
     if min_text_length is not None:
         translate_settings.translation.min_text_length = int(min_text_length)
-    # rpc_doclayout is intentionally not taken from the UI: it sends rendered
-    # pages to the given host, so it may only be set via CLI / config file.
 
     # UI uses positive switch, config uses negative flag, so we invert here
     if enable_auto_term_extraction is not None:
@@ -775,16 +773,15 @@ def _build_translate_settings(
             translate_settings.translation.primary_font_family = primary_font_family
 
     # Calculate and update rate limit settings
-    if service != "SiliconFlowFree":
-        qps, pool_workers = _calculate_rate_limit_params(
-            rate_limit_mode, ui_inputs, translate_settings.translation.qps or 4
-        )
+    qps, pool_workers = _calculate_rate_limit_params(
+        rate_limit_mode, ui_inputs, translate_settings.translation.qps or 4
+    )
 
-        # Update translation settings
-        translate_settings.translation.qps = int(qps)
-        translate_settings.translation.pool_max_workers = (
-            int(pool_workers) if pool_workers is not None else None
-        )
+    # Update translation settings
+    translate_settings.translation.qps = int(qps)
+    translate_settings.translation.pool_max_workers = (
+        int(pool_workers) if pool_workers is not None else None
+    )
 
     # Calculate and update term extraction rate limit settings
     if term_rate_limit_mode:
@@ -1028,7 +1025,7 @@ def build_ui_inputs(*args):
             service, lang_from, lang_to, page_range, page_input,
             no_mono, no_dual, dual_translate_first, use_alternating_pages_dual, watermark_output_mode,
             rate_limit_mode, rpm_input, concurrent_threads_input, custom_qps_input, custom_pool_max_workers_input,
-            prompt, min_text_length, rpc_doclayout, custom_system_prompt_input, glossary_file,
+            prompt, min_text_length, custom_system_prompt_input, glossary_file,
             save_auto_extracted_glossary, enable_auto_term_extraction, primary_font_family, skip_clean,
             disable_rich_text_translate, enhance_compatibility, split_short_lines, short_line_split_factor,
             translate_table_text, skip_scanned_detection, max_pages_per_part, formular_font_pattern,
@@ -1060,7 +1057,6 @@ def build_ui_inputs(*args):
         "custom_pool_workers",  # mapped from custom_pool_max_workers_input
         "prompt",
         "min_text_length",
-        "rpc_doclayout",
         "custom_system_prompt_input",
         "glossary_file",  # will be converted to glossaries
         "save_auto_extracted_glossary",
@@ -1975,13 +1971,6 @@ custom_css = """
     .env-warning {color: #dd5500 !important;}
     .env-success {color: #559900 !important;}
 
-    /* SiliconFlow logo: 添加白色背景，确保在深色模式下清晰可见 */
-    img[alt="Powered By SiliconFlow"] {
-        background-color: #ffffff !important;
-        padding: 4px !important;
-        border-radius: 4px !important;
-    }
-
     /* 保存设置按钮：添加背景色 */
     .save-settings-btn button,
     button.save-settings-btn {
@@ -2641,11 +2630,6 @@ tech_details_string = f"""
                     - GUI by: <a href="https://github.com/reycn">Rongxin</a> & <a href="https://github.com/hellofinch">hellofinch</a> & <a href="https://github.com/awwaawwa">awwaawwa</a> & <a href="https://github.com/zfb132">zfb132</a><br>
                     - pdf2zh Version: {__version__} <br>
                     - BabelDOC Version: {babeldoc_version}<br>
-                    - Free translation service provided by <a href="https://siliconflow.cn/" target="_blank" style="text-decoration: none;">SiliconFlow</a><br>
-                    <a href="https://siliconflow.cn/" target="_blank" style="text-decoration: none;">
-                        <img src="{ASSETS_URL}/powered_by_siliconflow_light.png" alt="Powered By SiliconFlow" style="height: 40px; margin-top: 10px; background-color: #ffffff; padding: 4px; border-radius: 4px;">
-                    </a>
-                    <br>
                 """
 update_current_languages(settings.gui_settings.ui_lang)
 # The following code creates the GUI
@@ -2803,12 +2787,6 @@ with gr.Blocks(
                 with gr.Group(visible=False, elem_classes=["settings-container"]) as tab_settings:
                     # 界面语言切换只在“设置”页展示
                     lang_selector.render()
-                    siliconflow_free_acknowledgement = gr.Markdown(
-                        _(
-                            "Free translation service provided by [SiliconFlow](https://siliconflow.cn)"
-                        ),
-                        visible=True,
-                    )
 
                     detail_index = 0
                     term_detail_index = 0
@@ -3231,14 +3209,6 @@ with gr.Blocks(
                             interactive=True,
                         )
 
-                        rpc_doclayout = gr.Textbox(
-                            label=_("RPC service for document layout analysis (optional)"),
-                            value="",  # not sent to the browser; set via CLI / config only
-                            visible=False,
-                            interactive=True,
-                            placeholder="http://host:port",
-                        )
-
                         save_auto_extracted_glossary = gr.Checkbox(
                             label=_("save automatically extracted glossary"),
                             value=settings.translation.save_auto_extracted_glossary,
@@ -3475,30 +3445,20 @@ with gr.Blocks(
                 return
             detail_group_index = detail_text_input_index_map.get(service_name, [])
             llm_support = LLM_support_index_map.get(service_name, False)
-            siliconflow_free_acknowledgement_visible = service_name == "SiliconFlowFree"
-            siliconflow_update = [
-                gr.update(visible=siliconflow_free_acknowledgement_visible)
-            ]
             return_list = []
             glossary_updates = [
                 gr.update(visible=llm_support)
                 for i in range(len(require_llm_translator_inputs))
             ]
             if len(detail_text_inputs) == 1:
-                return_list = (
-                    siliconflow_update
-                    + glossary_updates
-                    + [gr.update(visible=(0 in detail_group_index))]
-                )
+                return_list = glossary_updates + [
+                    gr.update(visible=(0 in detail_group_index))
+                ]
             else:
-                return_list = (
-                    siliconflow_update
-                    + glossary_updates
-                    + [
-                        gr.update(visible=(i in detail_group_index))
-                        for i in range(len(detail_text_inputs))
-                    ]
-                )
+                return_list = glossary_updates + [
+                    gr.update(visible=(i in detail_group_index))
+                    for i in range(len(detail_text_inputs))
+                ]
             return return_list
 
         def on_enhance_compatibility_change(enhance_value):
@@ -3539,11 +3499,8 @@ with gr.Blocks(
                 glossary_list = ["", "", ""]
             return gr.update(visible=True, value=glossary_list)
 
-        def on_rate_limit_mode_change(mode, service_name):
+        def on_rate_limit_mode_change(mode):
             """Update rate-limit-specific-settings visibility based on rate_limit_mode value"""
-            if service_name == "SiliconFlowFree":
-                return [gr.update(visible=False)] * 4  # Hide all options
-
             rpm_visible = mode == "RPM"
             threads_visible = mode == "Concurrent Threads"
             custom_visible = mode == "Custom"
@@ -3589,16 +3546,11 @@ with gr.Blocks(
             """Expand original on_select_service with rate-limit-UI updated"""
             original_updates = on_select_service(service_name)
 
-            rate_limit_visible = service_name != "SiliconFlowFree"
-
-            detailed_visible = [gr.update(visible=False)] * 4
-
-            if rate_limit_visible:
-                detailed_visible = on_rate_limit_mode_change(mode, service_name)
+            detailed_visible = on_rate_limit_mode_change(mode)
 
             # Add updates of rate-limit-UI
             rate_limit_updates = [
-                gr.update(visible=rate_limit_visible),
+                gr.update(visible=True),
             ]
 
             return original_updates + rate_limit_updates + detailed_visible
@@ -3681,11 +3633,7 @@ with gr.Blocks(
             page_input,
         )
 
-        on_select_service_outputs = (
-            [siliconflow_free_acknowledgement]
-            + require_llm_translator_inputs
-            + detail_text_inputs
-        )
+        on_select_service_outputs = require_llm_translator_inputs + detail_text_inputs
 
         service.select(
             on_service_change_with_rate_limit,
@@ -3706,7 +3654,7 @@ with gr.Blocks(
 
         rate_limit_mode.change(
             on_rate_limit_mode_change,
-            inputs=[rate_limit_mode, service],
+            inputs=[rate_limit_mode],
             outputs=[
                 rpm_input,
                 concurrent_threads_input,
@@ -3785,7 +3733,6 @@ with gr.Blocks(
             # Advanced Options
             prompt,
             min_text_length,
-            rpc_doclayout,
             custom_system_prompt_input,
             glossary_file,
             save_auto_extracted_glossary,
@@ -3823,7 +3770,6 @@ with gr.Blocks(
             *translation_engine_arg_inputs,
             # any UI components that are used by translate/save should be listed above!
             # Extra UI components to be updated on load (not used by translate/save)
-            siliconflow_free_acknowledgement,
             glossary_table,
             term_disabled_info,
         ]
@@ -3985,29 +3931,22 @@ with gr.Blocks(
                 )
                 updates.append(gr.update(value=watermark_value))
                 # Rate Limit Options
-                rate_limit_visible = selected_service != "SiliconFlowFree"
-                updates.append(gr.update(value="Custom", visible=rate_limit_visible))
+                updates.append(gr.update(value="Custom", visible=True))
                 updates.append(gr.update(visible=False))  # rpm_input
                 updates.append(gr.update(visible=False))  # concurrent_threads_input
                 updates.append(
-                    gr.update(
-                        value=fresh_settings.translation.qps or 4,
-                        visible=rate_limit_visible,
-                    )
+                    gr.update(value=fresh_settings.translation.qps or 4, visible=True)
                 )
                 updates.append(
                     gr.update(
                         value=fresh_settings.translation.pool_max_workers,
-                        visible=rate_limit_visible,
+                        visible=True,
                     )
                 )
                 # Advanced Options
                 updates.append(gr.update(value=""))  # prompt
                 updates.append(
                     gr.update(value=fresh_settings.translation.min_text_length)
-                )
-                updates.append(
-                    gr.update(value="")
                 )
                 updates.append(
                     gr.update(
@@ -4200,8 +4139,6 @@ with gr.Blocks(
                         updates.append(gr.update(value=value, visible=visible))
 
                 # Extra UI components at the end of ui_setting_controls
-                siliconflow_free_ack_visible = selected_service == "SiliconFlowFree"
-                updates.append(gr.update(visible=siliconflow_free_ack_visible))
                 updates.append(
                     gr.update(visible=llm_support)
                 )  # glossary_table visibility
@@ -4392,7 +4329,6 @@ def parse_user_passwd(file_path: str, welcome_page: str) -> tuple[list, str]:
 
 
 def setup_gui(
-    share: bool = False,
     auth_file: str | None = None,
     welcome_page: str | None = None,
     server_port=7860,
@@ -4402,7 +4338,6 @@ def setup_gui(
     This function sets up the GUI for the application.
 
     Inputs:
-        - share: Whether to share the GUI
         - auth_file: The authentication file
         - server_port: The port to run the server on
 
@@ -4418,7 +4353,10 @@ def setup_gui(
     launch_kwargs = {
         "debug": True,
         "inbrowser": inbrowser,
-        "share": share,
+        # Always pass False explicitly: Gradio would otherwise read GRADIO_SHARE
+        # (or default to True on Colab) and publish the WebUI, and the files it
+        # serves, to the internet through a gradio.live tunnel.
+        "share": False,
         "server_port": server_port,
         "app_kwargs": {
             "middleware": [Middleware(_WebUISecurityMiddleware)],
@@ -4435,8 +4373,6 @@ def setup_gui(
         print(
             "Error launching GUI using 0.0.0.0.\nThis may be caused by global mode of proxy software."
         )
-        # Never fall back to share=True here: that would publish the WebUI
-        # (and the files it serves) to the internet via a gradio.live tunnel.
         demo.launch(server_name="127.0.0.1", **launch_kwargs)
 
 

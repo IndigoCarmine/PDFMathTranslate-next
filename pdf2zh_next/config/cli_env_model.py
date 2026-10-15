@@ -6,7 +6,9 @@ from pydantic import Field
 from pydantic import create_model
 
 from pdf2zh_next.config.model import SettingsModel
-from pdf2zh_next.config.translate_engine_model import _DEFAULT_TRANSLATION_ENGINE
+from pdf2zh_next.config.translate_engine_model import (
+    DEFAULT_TRANSLATION_ENGINE_METADATA,
+)
 from pdf2zh_next.config.translate_engine_model import TERM_EXTRACTION_ENGINE_METADATA
 from pdf2zh_next.config.translate_engine_model import TRANSLATION_ENGINE_METADATA
 
@@ -92,16 +94,18 @@ CLIEnvSettingsModel = create_model(
 def to_settings_model(self) -> SettingsModel:
     for metadata in TRANSLATION_ENGINE_METADATA:
         if getattr(self, metadata.cli_flag_name):
-            if metadata.cli_detail_field_name:
-                translate_engine_settings = metadata.setting_model_type(
-                    **getattr(self, metadata.cli_detail_field_name).model_dump()
-                )
-            else:
-                translate_engine_settings = metadata.setting_model_type()
             break
     else:
-        logger.warning("No translation engine selected, using SiliconFlow Free")
-        translate_engine_settings = _DEFAULT_TRANSLATION_ENGINE()
+        metadata = DEFAULT_TRANSLATION_ENGINE_METADATA
+        logger.info(
+            f"No translation engine selected, using {metadata.translate_engine_type}"
+        )
+    if metadata.cli_detail_field_name:
+        translate_engine_settings = metadata.setting_model_type(
+            **getattr(self, metadata.cli_detail_field_name).model_dump()
+        )
+    else:
+        translate_engine_settings = metadata.setting_model_type()
 
     # Term extraction engine (optional)
     term_extraction_engine_settings = None

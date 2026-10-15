@@ -61,7 +61,6 @@ class BasicSettings(BaseModel):
 class GUISettings(BaseModel):
     """GUI related settings"""
 
-    share: bool = Field(default=False, description="Enable sharing mode")
     auth_file: str | None = Field(
         default=None, description="Path to the authentication file"
     )
@@ -84,10 +83,6 @@ class TranslationSettings(BaseModel):
 
     min_text_length: int = Field(
         default=5, description="Minimum text length to translate"
-    )
-    rpc_doclayout: str | None = Field(
-        default=None,
-        description="RPC service host address for document layout analysis",
     )
     lang_in: str = Field(default="en", description="Source language code")
     lang_out: str = Field(default="zh", description="Target language code")
@@ -226,13 +221,13 @@ class SettingsModel(BaseModel):
     translation: TranslationSettings = Field(default_factory=TranslationSettings)
     pdf: PDFSettings = Field(default_factory=PDFSettings)
     gui_settings: GUISettings = Field(default_factory=GUISettings)
+    # Only one engine type is left, so these are no longer discriminated unions.
     translate_engine_settings: TRANSLATION_ENGINE_SETTING_TYPE | None = Field(
-        description="Translation engine settings", discriminator="translate_engine_type"
+        description="Translation engine settings"
     )
     term_extraction_engine_settings: TERM_EXTRACTION_ENGINE_SETTING_TYPE | None = Field(
         default=None,
         description="Term extraction translation engine settings",
-        discriminator="translate_engine_type",
     )
 
     def clone(self) -> SettingsModel:
@@ -429,10 +424,6 @@ class SettingsModel(BaseModel):
             log.warning(
                 "After enabling automatic OCR Workaround, scan version detection will be forcibly enabled."
             )
-
-        if self.translate_engine_settings.translate_engine_type == "SiliconFlowFree":
-            # Force qps to 20 for SiliconFlowFree
-            self.translation.qps = 20
 
     def parse_pages(self) -> list[tuple[int, int]] | None:
         """Parse pages string into list of page ranges"""

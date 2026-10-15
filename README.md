@@ -37,8 +37,12 @@
 PDF scientific paper translation and bilingual comparison. Based on [BabelDOC](https://github.com/funstory-ai/BabelDOC). Additionally, this project is also the official reference implementation for calling BabelDOC to perform PDF translation.
 
 - 📊 Preserve formulas, charts, table of contents, and annotations _([preview](#preview))_.
-- 🌐 Support [multiple languages](https://pdf2zh-next.com/supported_languages.html), and diverse [translation services](https://pdf2zh-next.com/advanced/Documentation-of-Translation-Services.html).
+- 🌐 Support [multiple languages](https://pdf2zh-next.com/supported_languages.html).
 - 🤖 Provides [commandline tool](https://pdf2zh-next.com/getting-started/USAGE_commandline.html), [interactive user interface](https://pdf2zh-next.com/getting-started/USAGE_webui.html), and [Docker](https://pdf2zh-next.com/getting-started/INSTALLATION_docker.html)
+
+> [!IMPORTANT]
+>
+> **Claude Code only.** In this version, document content leaves the machine only through the [Claude Code](https://claude.com/claude-code) CLI (`--claudecode`, the default and only translation engine). Everything else that uploads or sends data has been removed: the other translation services (OpenAI-compatible APIs, SiliconFlow, DeepL, Google, Bing, Ollama, the external CLI translator, …), separate term extraction engines, the remote layout analysis service (`--rpc-doclayout`) and the Gradio public share link. Downloads (models, fonts, a PDF from a link) still work. The online documentation below still describes the upstream services, which are not available here.
 
 <!-- Feel free to provide feedback in [GitHub Issues](https://github.com/PDFMathTranslate-next/PDFMathTranslate-next/issues) or [Telegram Group](https://t.me/+Z9_SgnxmsmA5NzBl). -->
 
@@ -100,8 +104,6 @@ If you don't know what code to use to translate to the language you need, check 
 <h2 id="acknowledgement">Acknowledgements</h2>
 
 - [Immersive Translation](https://immersivetranslate.com) sponsors monthly Pro membership redemption codes for active contributors to this project, see details at: [CONTRIBUTOR_REWARD.md](https://github.com/funstory-ai/BabelDOC/blob/main/docs/CONTRIBUTOR_REWARD.md)
-
-- [SiliconFlow](https://siliconflow.cn) provides a free translation service for this project, powered by large language models (LLMs).
 
 - 1.x version: [Byaidu/PDFMathTranslate](https://github.com/Byaidu/PDFMathTranslate)
 
